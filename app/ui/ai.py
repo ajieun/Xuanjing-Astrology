@@ -28,7 +28,7 @@ class AiRunner:
             self.button.setEnabled(not running)
             self.button.setText("解读中…" if running else label or self.button.text())
 
-    def run(self, messages, on_success, title="AI 解读"):
+    def run(self, messages, on_success, title="AI 解读", json_mode=True):
         settings = self.settings_getter() if self.settings_getter else {}
         if not str(settings.get("api_key", "")).strip():
             QMessageBox.information(self.owner, "需要配置", "请先在右上角「设置」里填写 DeepSeek API Key。")
@@ -41,16 +41,24 @@ class AiRunner:
         self.output.setHtml(
             f"<div style='color:{TEXT_DIM};padding:20px;'>正在请求模型解读，通常 20-60 秒…</div>"
         )
-        self.worker = ChatWorker(messages, settings, self.owner)
+        self.worker = ChatWorker(messages, settings, self.owner, json_mode=json_mode)
 
         def on_done(content):
             self.busy(False)
             try:
                 on_success(content)
                 self._say(f"{title}完成")
-            except Exception as exc:  # noqa: BLE001
-                self.output.setPlainText(content)
-                self._say(f"解析模型结果失败：{exc}")
+            except Exception:  # noqa: BLE001 - 兜底：只展示人话，绝不回显 JSON 原文
+                text = deepseek.as_text(content)
+                notice = (
+                    f"<div style='color:{GOLD};padding:0 0 10px 0;font-size:13px;'>"
+                    f"模型这次没有按格式返回，已整理成可读文本；可以再点一次「{title}」重试。</div>"
+                )
+                body = markdown_to_html(text) if text else (
+                    f"<div style='color:{TEXT_DIM};padding:8px 0;'>这次没有取到可用的解读内容。</div>"
+                )
+                self.output.setHtml(notice + body)
+                self._say(f"{title}未按格式返回，已转为纯文本")
 
         def on_failed(message):
             self.busy(False)
@@ -64,20 +72,45 @@ class AiRunner:
         return True
 
 
+def _safe_card(card):
+    """把单个卡片里的字段压平成文本，避免结构化数据直接漏到界面。"""
+    if not isinstance(card, dict):
+        return {"title": "", "badge": "", "body": deepseek.as_text(card)}
+    safe = dict(card)
+    safe["title"] = deepseek.as_text(card.get("title", ""))
+    safe["badge"] = deepseek.as_text(card.get("badge", ""))
+    safe["body"] = deepseek.as_text(card.get("body", ""))
+    probs = []
+    for prob in card.get("probabilities", []) or []:
+        if not isinstance(prob, dict):
+            continue
+        try:
+            pct = max(0, min(100, int(prob.get("pct", 0))))
+        except (TypeError, ValueError):
+            continue
+        probs.append({"label": deepseek.as_text(prob.get("label", "")), "pct": pct})
+    safe["probabilities"] = probs
+    return safe
+
+
 def render_ziwei_reading(browser, reading, header=""):
     """渲染紫微解读（HTML 卡片 + 校准问题）。"""
-    cards = reading.get("cards", []) or []
+    if not isinstance(reading, dict):
+        render_markdown(browser, reading)
+        return
+
+    cards = [c for c in (reading.get("cards", []) or []) if c]
     parts = []
     if header:
         parts.append(f"<div style='color:{TEXT_DIM};font-size:12px;margin-bottom:6px;'>{html.escape(header)}</div>")
     for card in cards:
-        parts.append(reading_card_html(card))
+        parts.append(reading_card_html(_safe_card(card)))
 
     questions = reading.get("calibration_questions", []) or []
     if questions:
         items = "".join(
-            f"<li style='margin:6px 0;'>{html.escape(str(q.get('text', '')))}"
-            f"<span style='color:{TEXT_DIM};'> {html.escape(str(q.get('hint', '')))}</span></li>"
+            f"<li style='margin:6px 0;'>{html.escape(deepseek.as_text(q.get('text', '') if isinstance(q, dict) else q))}"
+            f"<span style='color:{TEXT_DIM};'> {html.escape(deepseek.as_text(q.get('hint', '') if isinstance(q, dict) else ''))}</span></li>"
             for q in questions
         )
         parts.append(
@@ -94,20 +127,24 @@ def render_ziwei_reading(browser, reading, header=""):
 
 
 def render_markdown(browser, markdown_text):
-    browser.setHtml(markdown_to_html(markdown_text))
+    browser.setHtml(markdown_to_html(deepseek.as_text(markdown_text)))
 
 
 def render_structured(browser, data, title_key="overall", cards_key=None):
     """渲染周易/道家/塔罗这类结构化结果。"""
-    overall = data.get(title_key, "")
+    if not isinstance(data, dict):
+        render_markdown(browser, data)
+        return
+
+    overall = deepseek.as_text(data.get(title_key, ""))
     parts = [f"<div style='font-size:15px;line-height:1.9;margin-bottom:10px;'>{markdown_to_html(overall)}</div>"]
 
     for card in data.get(cards_key or "__none__", []) or []:
         if not isinstance(card, dict):
             continue
-        position = card.get("position", "")
-        name = card.get("card", "")
-        reading = markdown_to_html(str(card.get("reading", "")))
+        position = deepseek.as_text(card.get("position", ""))
+        name = deepseek.as_text(card.get("card", ""))
+        reading = markdown_to_html(deepseek.as_text(card.get("reading", "")))
         parts.append(
             f"<div style='border:1px solid {LINE};border-left:3px solid {GOLD};border-radius:4px;"
             f"padding:12px 14px;margin:10px 0;background:{PANEL};'>"
@@ -118,22 +155,26 @@ def render_structured(browser, data, title_key="overall", cards_key=None):
 
     for key, label in (("lines_reading", "爻辞白话"), ("actions", "宜"), ("cautions", "忌"), ("advice", "建议")):
         values = data.get(key) or []
+        if isinstance(values, str):
+            values = [values]
         if not values:
             continue
-        items = "".join(f"<li style='margin:5px 0;line-height:1.7;'>{markdown_to_html(str(v))}</li>" for v in values)
+        items = "".join(
+            f"<li style='margin:5px 0;line-height:1.7;'>{markdown_to_html(deepseek.as_text(v))}</li>" for v in values
+        )
         parts.append(
             f"<div style='margin:12px 0;'><div style='color:#c8a35a;'>{label}</div>"
             f"<ul style='margin:6px 0 0 18px;'>{items}</ul></div>"
         )
 
     for section in data.get("sections", []) or []:
-        parts.append(reading_card_html(section))
+        parts.append(reading_card_html(_safe_card(section)))
 
     timing = data.get("timing")
     if timing:
         parts.append(
             f"<div style='border-left:3px solid #6fa08a;padding:10px 14px;margin:14px 0;'>"
-            f"<span style='color:#6fa08a;'>时机</span> {markdown_to_html(str(timing))}</div>"
+            f"<span style='color:#6fa08a;'>时机</span> {markdown_to_html(deepseek.as_text(timing))}</div>"
         )
 
     browser.setHtml("".join(parts))

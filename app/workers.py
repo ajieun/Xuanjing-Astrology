@@ -10,14 +10,15 @@ class ChatWorker(QThread):
     finished = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, messages, settings, parent=None):
+    def __init__(self, messages, settings, parent=None, json_mode=True):
         super().__init__(parent)
         self.messages = messages
         self.settings = settings
+        self.json_mode = json_mode
 
     def run(self):
         try:
-            content, _ = deepseek.chat(self.messages, self.settings)
+            content, _ = deepseek.chat(self.messages, self.settings, json_mode=self.json_mode)
         except Exception as exc:  # noqa: BLE001 - 线程内统一转成界面提示
             self.failed.emit(str(exc))
             return

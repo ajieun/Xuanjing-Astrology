@@ -2,6 +2,7 @@
 
 原则：排盘与格局判定由本地规则引擎完成，模型只负责把象数语言翻译成人话。
 """
+import datetime
 import json
 
 from . import knowledge
@@ -17,9 +18,73 @@ _PERSONA = """你是一位精通中国传统命理的咨询顾问，融会紫微
 - 命盘显示可能性，行动决定现实；涉及健康、法律、投资时提醒咨询专业人士。
 - 全文使用简体中文。"""
 
+
+def _now_info():
+    """每次调用都重新读取系统时间，绝不缓存、绝不写死。"""
+    moment = datetime.datetime.now()
+    lunar_text = ""
+    ganzhi = ""
+    next_ganzhi = ""
+    try:
+        from lunar_python import Solar
+
+        lunar = Solar.fromYmdHms(
+            moment.year, moment.month, moment.day,
+            moment.hour, moment.minute, moment.second,
+        ).getLunar()
+        ganzhi = lunar.getYearInGanZhi()
+        lunar_text = f"{ganzhi}年{lunar.getMonthInChinese()}月{lunar.getDayInChinese()}"
+        next_ganzhi = Solar.fromYmd(moment.year + 1, 6, 1).getLunar().getYearInGanZhi()
+    except Exception:  # noqa: BLE001 - 历法库异常时退回纯公历
+        pass
+    return moment, lunar_text, ganzhi, next_ganzhi
+
+
+def _today_block():
+    """把请求当刻的真实时间写进提示词，避免模型拿训练数据里的旧年份当「今年」。"""
+    moment, lunar_text, ganzhi, next_ganzhi = _now_info()
+    weekday = "一二三四五六日"[moment.weekday()]
+    lines = [
+        "时间基准（每次请求实时获取，必须遵守）：",
+        f"- 现在是 {moment.year} 年 {moment.month} 月 {moment.day} 日 "
+        f"{moment.hour:02d}:{moment.minute:02d}（星期{weekday}，Asia/Shanghai）。",
+    ]
+    if lunar_text:
+        lines.append(f"- 当前农历：{lunar_text}；当前流年：{ganzhi}年（{moment.year}）。")
+        if next_ganzhi:
+            lines.append(f"- 下一个流年：{next_ganzhi}年（{moment.year + 1}）。")
+    lines.append(
+        f"- 「今年」「明年」「近两年」「当前流年」「未来几年」一律以此为基准，正文里写明确年份。"
+    )
+    lines.append(
+        f"- 训练数据里的旧年份已经过期：早于 {moment.year} 年的年份只能是过去，不能当作未来或当下。"
+    )
+    return "\n".join(lines)
+
+
+def _time_hint():
+    """放在 user 消息末尾的一句话时间锚点（离模型最近，遵守率最高）。"""
+    moment, _, ganzhi, _ = _now_info()
+    suffix = f"，当前流年 {ganzhi}年" if ganzhi else ""
+    return (
+        f"【时间锚点】今天实时时间为 {moment.year} 年 {moment.month} 月 {moment.day} 日"
+        f" {moment.hour:02d}:{moment.minute:02d}{suffix}。"
+        f"凡涉及「今年/明年/未来几年」的表述，都必须以此推算，"
+        f"禁止把 {moment.year - 1} 年及更早的年份当作当下。"
+    )
+
+
+def _base():
+    return _PERSONA + "\n\n" + _today_block()
+
+
 _COMMON_RULES = """输出要求：
-- 只输出一个 JSON 对象，不要出现 ``` 代码块围栏，不要有任何解释性前后缀。
+- 只输出一个 JSON 对象：第一个字符必须是 {，最后一个字符必须是 }。
+- 不要出现 ``` 代码块围栏，不要有任何解释性前后缀。
 - JSON 必须能被 Python json.loads 直接解析。
+- 所有正文类字段（body / reading / overall / advice / cautions / actions / timing 等）只写自然语言；
+  严禁在这些字段里嵌套或粘贴 JSON、键值对、大括号结构、代码块，也不要重复整份结构。
+- 正文需要强调时只允许 <strong> <em> <br> <span class='warn'> <span class='good'> 这些简单标签。
 - 参考资料里可能出现繁体字，输出时一律转成简体中文。"""
 
 
@@ -39,7 +104,7 @@ def ziwei_messages(chart_data, focus="", extra_note=""):
 
     focus_text = focus.strip() or "全面解读（命盘底色、事业、财运、感情、当前大限）"
     system = "\n\n".join([
-        _PERSONA,
+        _base(),
         "下面是本地典籍，作为你的取象与措辞依据：",
         "### 解读风格指南\n" + (guide or "（略）"),
         "### 星曜参考\n" + (stars or "（略）"),
@@ -67,11 +132,16 @@ def ziwei_messages(chart_data, focus="", extra_note=""):
 每章 2-4 段，不要写成教科书。calibration_questions 给 3-5 个用于校准的问题。""",
     ])
 
+    target_year = (chart_data.get("time_travel_analysis") or {}).get("target_year")
+    target_year = target_year or datetime.date.today().year
+
     user = "\n\n".join([
         f"本次解读重点：{focus_text}",
+        f"本次流年基准：{target_year} 年（流年压力与应期均按这一年推算，不要换成别的年份）",
         "排盘数据（本地规则引擎确定性计算，请以此为准，不要自行改盘）：",
         "```json\n" + _compact_chart(chart_data) + "\n```",
         extra_note.strip() or "（无补充信息）",
+        _time_hint(),
     ])
 
     return [
@@ -82,7 +152,7 @@ def ziwei_messages(chart_data, focus="", extra_note=""):
 
 def yijing_messages(result, question=""):
     system = "\n\n".join([
-        _PERSONA,
+        _base(),
         """你现在做的是周易筮法解读。依据朱熹《易学启蒙》考变占：
 0 动爻看本卦彖辞；1 爻动看本卦动爻辞；2 爻动兼看两动爻辞（上爻为主）；
 3 爻动参本卦与之卦彖辞（初爻变主贞，二爻起变主悔）；
@@ -104,6 +174,7 @@ def yijing_messages(result, question=""):
         f"所占之事：{question.strip() or '（未写明具体问题，作整体近况占）'}",
         "起卦结果（本地筮法引擎计算）：",
         "```json\n" + json.dumps(result, ensure_ascii=False) + "\n```",
+        _time_hint(),
     ])
     return [
         {"role": "system", "content": system},
@@ -113,7 +184,7 @@ def yijing_messages(result, question=""):
 
 def tarot_messages(result, question="", focus=""):
     system = "\n\n".join([
-        _PERSONA,
+        _base(),
         """你现在做的是塔罗牌解读（韦特体系，含正逆位）。要点：
 
 - 你是在跟一个朋友喝咖啡时解牌，不是在做卡牌说明书。不要逐张复述牌义。
@@ -145,6 +216,7 @@ cards_reading 必须覆盖牌阵里的每一张牌，顺序与给定数据一致
         f"解读重点：{focus.strip() or '整体走势'}",
         "牌阵数据（本地洗牌抽取，牌义以给定内容为准）：",
         "```json\n" + json.dumps(result, ensure_ascii=False) + "\n```",
+        _time_hint(),
     ])
     return [
         {"role": "system", "content": system},
@@ -154,7 +226,7 @@ cards_reading 必须覆盖牌阵里的每一张牌，顺序与给定数据一致
 
 def daoyin_messages(bazi, focus=""):
     system = "\n\n".join([
-        _PERSONA,
+        _base(),
         """你现在做的是道家术数视角的四柱解读：以阴阳五行生克制化、三元九运当令之气、
 建除十二神的宜忌为骨架，用《道德经》《清静经》的处世智慧来收束建议。
 观点要明确，但要落到具体的生活节奏、用神取舍与一两年的时机判断上。""",
@@ -176,6 +248,7 @@ def daoyin_messages(bazi, focus=""):
         f"解读重点：{focus.strip() or '命局与近两年时机'}",
         "四柱与术数数据（本地历法库计算）：",
         "```json\n" + json.dumps(bazi, ensure_ascii=False, default=str) + "\n```",
+        _time_hint(),
     ])
     return [
         {"role": "system", "content": system},

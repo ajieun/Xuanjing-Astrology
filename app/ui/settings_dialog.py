@@ -17,7 +17,7 @@ from .. import config
 from .ai import test_connection
 from .theme import GOLD
 
-MODELS = ["deepseek-chat", "deepseek-reasoner"]
+MODELS = ["deepseek-v4-pro", "deepseek-v4-flash", "deepseek-chat", "deepseek-reasoner"]
 
 
 class SettingsDialog(QDialog):

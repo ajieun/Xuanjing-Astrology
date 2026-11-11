@@ -393,7 +393,7 @@ class ZiweiView(QWidget):
 
         def on_success(content):
             self.reading = deepseek.extract_json(content)
-            current = self.reading.get("current_decadal_display", "")
+            current = deepseek.as_text(self.reading.get("current_decadal_display", "") if isinstance(self.reading, dict) else "")
             render_ziwei_reading(self.browser, self.reading, header=f"当前大限：{current}" if current else "")
             self.status.showMessage("解读完成，可用「导出命盘 HTML」生成完整报告")
 

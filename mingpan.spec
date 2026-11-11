@@ -26,14 +26,18 @@ datas = [
 
 hiddenimports = [
     "lunar_python",
-    "ephem",
+    "lunarcalendar",
     "numpy",
     "cn2an",
     "iztro_py",
     "pydantic",
     "pydantic.deprecated.decorator",
+    "pydantic_core",
+    "typing_inspection",
+    "typing_inspect",
     "ichingshifa",
     "ichingshifa.ichingshifa",
+    "ephem",
 ]
 
 block_cipher = None
